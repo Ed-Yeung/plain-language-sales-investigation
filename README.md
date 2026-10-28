@@ -1,66 +1,78 @@
 # Sales Check
 
-A store manager asks one plain-language question about sales. The app plans a short investigation, runs read-only queries against a DuckDB table, and returns charts plus an evidence-backed first answer. It is an initial check, not a replacement for a governed BI report.
+**An AI-powered sales investigation agent for non-technical business users.**
 
-## Use case
+Sales Check turns a plain-language business question into a short, multi-step investigation. It queries sales data in DuckDB, generates charts, and returns an initial explanation supported by numerical evidence.
 
-A non-technical store manager sees that a region looks weak and does not want to wait for the BI team before deciding what to look at. The manager types a question such as "Why is Kowloon down this week?" The app compares the latest seven days in the file with the seven days before them, then drills into the weakest region or category. The answer states the finding, the numbers behind it, the comparison, and what the data cannot explain.
+Rather than waiting for the BI team to build a new dashboard, a store manager can use it to investigate a potential performance issue and identify where to look next.
 
-The sample is a single retail chain, Lane & Co., with stores in Kowloon, Hong Kong Island, and New Territories. Categories are Beverage, Snacks, Household, and Fresh.
+> **Example question:** “Why is Kowloon down this week?”
 
-## Data
+Sales Check is designed for an initial investigation, not as a replacement for a governed BI report.
 
-The page reads one DuckDB table, `sales`. There is no file upload.
+---
 
-| | |
+## 1. Business Problem
+
+A store manager notices that sales performance in one region has dropped but does not have the technical skills to investigate the underlying data independently.
+
+The usual process may require the manager to request additional reports from the BI team, creating a delay between identifying a problem and understanding it.
+
+Sales Check addresses this gap by allowing the manager to:
+
+- Ask business questions in natural language.
+- Investigate performance across different regions and product categories.
+- Compare the latest seven days with the preceding seven days.
+- Receive charts, supporting figures, and an initial explanation.
+- Identify what the available data can—and cannot—explain.
+
+**Business objective:** Shorten the distance between identifying a sales problem and beginning an evidence-based investigation.
+
+## 2. How It Works
+
+The application follows a structured investigation workflow using LangGraph. Each step has a defined responsibility, helping separate question planning, code generation, data execution, and answer writing.
+
+```mermaid
+flowchart TD
+    A["Store Manager<br/>Asks a business question"] --> B["Explorer<br/>Profiles the sales table"]
+    B --> C["Planner<br/>Creates a structured investigation plan"]
+    C --> D{"Can the available data answer it?"}
+
+    D -- No --> R["Explain why the question cannot be answered"]
+    D -- Yes --> E["Coder<br/>Generates a Python script"]
+
+    E --> F["Execute<br/>Validate and query DuckDB"]
+    F --> G{"Did execution succeed?"}
+
+    G -- Yes --> H["Keep the result table and chart"]
+    G -- No --> I["Retry the failed script once"]
+    I --> J{"Did the retry succeed?"}
+
+    J -- Yes --> H
+    J -- No --> X["Stop the investigation"]
+
+    H --> K{"Are more planned steps needed?"}
+    K -- Yes --> E
+    K -- No --> L["Writer<br/>Summarises returned results"]
+
+    L --> M["Finding · Evidence · Comparison · Limit"]
+
+    classDef user fill:#E8F1FE,stroke:#4776B4,color:#17365D
+    classDef agent fill:#E8F5E9,stroke:#4F8A5B,color:#1D4826
+    classDef execution fill:#FFF3D6,stroke:#C18B2C,color:#684A0B
+    classDef output fill:#F1E8FC,stroke:#8B69B0,color:#412765
+    classDef stop fill:#FCE8E6,stroke:#C65B52,color:#7A2420
+
+    class A user
+    class B,C,E,L agent
+    class F,H,I,J execution
+    class M output
+    class R,X stop
+```
+
+### Investigation lifecycle
+
+| Stage | Responsibility |
 |---|---|
-| Grain | One row per day, region, and category |
-| Rows | 1,416 |
-| Dates | 1 Jul 2026 to 26 Oct 2026 |
-| Columns | `date`, `year`, `month`, `weekday`, `region`, `category`, `sales`, `cost`, `units`, `orders` |
-
-`data/sample_sales.csv` is only the source file. `python build_db.py` loads it into `data/sales.duckdb`. Rebuild only after the CSV changes.
-
-"This week" is not a fixed date and not the calendar week on the computer. The app takes the latest date in the table, uses that day and the six days before it, and compares those seven days with the previous seven.
-
-## Data flow
-
-Question, then Explorer, Planner, Coder, Execute, and Writer.
-
-- Explorer reads `sales` and records the columns, category values, and the two week windows.
-- Planner turns the question into 1 to 3 steps, or refuses it.
-- Coder writes one Python script for the current step.
-- Execute runs that script against DuckDB and keeps the chart and the table.
-- The next step repeats Coder, up to 3 rounds. A failed script is retried once.
-- Writer writes the answer from those tables only.
-
-## Logic
-
-Explorer does not call the model. It profiles the table in Python. Planner calls DeepSeek and must return a structured plan: purpose, columns, chart type, and one instruction per step. A ranking is one step. A "why" question is two or three. A question that needs a missing field, such as weather or staff, is refused.
-
-Coder calls DeepSeek once per step and returns one Python script. The script may only `SELECT` from `sales`, using a read-only connection. Profit margin is `SUM(sales - cost) / SUM(sales)`, not the average of row-level ratios. Execute checks the script, runs it in a temporary folder, and reads `fig0.json` and `result.json`. Writer sees the result tables, not the source rows. It uses four headings: Finding, Evidence, Comparison, and Limit.
-
-The model chooses the comparison. Python executes it and checks the boundary.
-
-## Stack
-
-Python, LangGraph, DeepSeek API, Pydantic, DuckDB, Pandas, Plotly, Streamlit.
-
-## Benefit
-
-- A non-technical user can start from a business question instead of a dashboard filter.
-- The investigation can take a second and third step, instead of answering from one query.
-- Calculations stay in DuckDB. The model does not invent the figures in the tables.
-- Each chart has the rows and the script that produced it.
-- The date window follows the latest row, so it stays correct after the table is rebuilt.
-
-## Limitations
-
-- One table and one demo dataset. It does not connect to a warehouse or support several users.
-- The sample is synthetic. The Kowloon beverage drop is planted so the flow can be demonstrated.
-- At most three rounds, and one retry per script. A bad script ends the investigation early.
-- The answer is only as good as the query the model writes. There is no certified metric catalog.
-- "This week" means the last seven dates in the file, not a business calendar week.
-- The writer is instructed to quote only returned numbers, but it can still phrase a comparison poorly.
-- Questions about causes outside the table, such as rent, staff, or promotion spend, cannot be answered.
-- Nothing is saved. Refreshing the page clears the result.
+| **Explorer** | Profiles the table, identifies columns and category values, and calculates the comparison windows. |
+| **Planner** | Converts the question into a structured plan containing the purpose
