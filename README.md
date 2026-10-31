@@ -1,249 +1,138 @@
-# Sales Check
+# Multi-Agent Data Analyst
 
-**An AI-powered sales investigation agent for non-technical business users.**
+> Upload a CSV, and a system of **4 AI agents** collaborates to analyze it automatically: data exploration, analysis planning, Python code generation **and execution**, then natural-language insights.
 
-Sales Check turns a plain-language business question into a short, multi-step investigation. It queries sales data in DuckDB, generates charts, and returns an initial explanation supported by numerical evidence.
-
-Rather than waiting for the BI team to build a new dashboard, a store manager can use it to investigate a potential performance issue and identify where to look next.
-
-> **Example question:** “Why is Kowloon down this week?”
-
-Sales Check is designed for an initial investigation, not as a replacement for a governed BI report.
+Built with **LangGraph**, this project goes beyond a simple "call an LLM" wrapper: it implements real multi-agent orchestration with shared state, structured output, a **self-correction loop**, and **sandboxed code execution** whose security trade-offs are deliberate and documented.
 
 ---
 
-## 1. Business Problem
+## What it does
 
-A store manager notices that sales performance in one region has dropped but does not have the technical skills to investigate the underlying data independently.
+Given any CSV file, the system:
 
-The usual process may require the manager to request additional reports from the BI team, creating a delay between identifying a problem and understanding it.
+1. **inspects** the data (columns, types, missing values, statistics);
+2. **decides** which analyses and visualizations are relevant;
+3. **writes Python code** (pandas + Plotly), **executes it**, and **fixes itself** if the code fails;
+4. **interprets** the resulting charts and **writes** readable insights.
 
-Sales Check addresses this gap by allowing the manager to:
+Everything is driven through a **Streamlit** web interface: upload a CSV, click run, and get interactive charts alongside a written analysis.
 
-- Ask business questions in natural language.
-- Investigate performance across different regions and product categories.
-- Compare the latest seven days with the preceding seven days.
-- Receive charts, supporting figures, and an initial explanation.
-- Identify what the available data can—and cannot—explain.
+The system is **data-agnostic**: no column name is hard-coded. It adapts to the structure it *discovers*, so it works on datasets other than the one used during development.
 
-**Business objective:** Shorten the distance between identifying a sales problem and beginning an evidence-based investigation.
+---
 
-## 2. How It Works
+## Architecture
 
-The application follows a structured investigation workflow using LangGraph. Each step has a defined responsibility, helping separate question planning, code generation, data execution, and answer writing.
+Four agents collaborate through a **shared state** (a common "whiteboard"). Agents never call each other directly: each reads what it needs from the state and writes its own contribution back. This decoupling makes every agent independently testable and replaceable.
 
 ```mermaid
-flowchart TD
-    A["Store Manager<br/>Asks a business question"] --> B["Explorer<br/>Profiles the sales table"]
-    B --> C["Planner<br/>Creates a structured investigation plan"]
-    C --> D{"Can the available data answer it?"}
-
-    D -- No --> R["Explain why the question cannot be answered"]
-    D -- Yes --> E["Coder<br/>Generates a Python script"]
-
-    E --> F["Execute<br/>Validate and query DuckDB"]
-    F --> G{"Did execution succeed?"}
-
-    G -- Yes --> H["Keep the result table and chart"]
-    G -- No --> I["Retry the failed script once"]
-    I --> J{"Did the retry succeed?"}
-
-    J -- Yes --> H
-    J -- No --> X["Stop the investigation"]
-
-    H --> K{"Are more planned steps needed?"}
-    K -- Yes --> E
-    K -- No --> L["Writer<br/>Summarises returned results"]
-
-    L --> M["Finding · Evidence · Comparison · Limit"]
-
-    classDef user fill:#E8F1FE,stroke:#4776B4,color:#17365D
-    classDef agent fill:#E8F5E9,stroke:#4F8A5B,color:#1D4826
-    classDef execution fill:#FFF3D6,stroke:#C18B2C,color:#684A0B
-    classDef output fill:#F1E8FC,stroke:#8B69B0,color:#412765
-    classDef stop fill:#FCE8E6,stroke:#C65B52,color:#7A2420
-
-    class A user
-    class B,C,E,L agent
-    class F,H,I,J execution
-    class M output
-    class R,X stop
+graph TD
+    START([CSV uploadé]) --> EXP[ Explorer<br/>deterministic pandas profiling]
+    EXP --> PLAN[ Planner<br/>LLM + structured Pydantic output]
+    PLAN --> CODE[ Coder<br/>generates + executes code in a sandbox]
+    CODE -->|success| WRITE[ Writer<br/>natural-language insights]
+    CODE -->|error, retries left| CODE
+    CODE -->|give up after 3 attempts| WRITE
+    WRITE --> END([Graphiques + insights])
 ```
 
-### Investigation lifecycle
-
-| Stage | Responsibility |
-|---|---|
-| **Explorer** | Profiles the table, identifies columns and category values, and calculates the comparison windows. |
-| **Planner** | Converts the question into a structured plan containing the purpose, columns, chart type, and step instructions. |
-| **Coder** | Uses DeepSeek to generate one Python script for the current investigation step. |
-| **Execute** | Validates and runs the script against DuckDB, retaining the result table and chart. |
-| **Iterate** | Continues to the next planned step, with a maximum of three steps and one retry per failed script. |
-| **Writer** | Produces an evidence-backed answer using the returned result tables rather than the raw source data. |
-
-A simple ranking question may require only one step. A question asking *why* performance has declined may require two or three steps to examine the weakest region or category.
-
-Questions requiring unavailable information, such as staff levels or weather, are refused rather than investigated using unsupported assumptions.
+| Agent | Role | Tool | Why this choice |
+|-------|------|------|-----------------|
+| **Explorer** | Profiles the dataset (facts) | pandas, **deterministic** | Counting rows or detecting types are *facts*: compute them exactly, don't ask an LLM (hallucination risk). |
+| **Planner** | Decides the analyses | LLM + **structured output** | Its output feeds the Coder → enforce a Pydantic schema (a machine *contract*), not free text. |
+| **Coder** | Generates and runs the code | LLM + **sandbox** + **retry loop** | Its output must actually *run*: isolated execution, plus self-correction on error (see below). |
+| **Writer** | Writes the insights | LLM, **free text** | Its deliverable is prose for a human → no schema, and a higher temperature for a natural tone. |
 
 ---
 
-## 3. Sample Dataset
+## Multi-agent concepts demonstrated
 
-The application reads a single DuckDB table named `sales`. There is no file-upload interface.
+This project was an opportunity to apply concrete agentic-system patterns:
 
-| Property | Details |
-|---|---|
-| **Business** | Lane & Co. |
-| **Dataset size** | 1,416 rows |
-| **Date range** | 1 July 2026 – 26 October 2026 |
-| **Geographic coverage** | Kowloon, Hong Kong Island, New Territories |
-| **Product categories** | Beverage, Snacks, Household, Fresh |
-| **Data grain** | One row per day, region, and category |
+- **Shared state & reducers** — a typed state (`TypedDict`) where each field has an update policy: some *overwrite* (latest result), others *accumulate* (`operator.add`) to keep a memory of past attempts.
+- **Structured output as a contract between agents** — when one agent feeds another, a Pydantic schema is enforced; when it produces for a human, free text is allowed.
+- **Self-correction loop (conditional edge)** — after the Coder, a routing function inspects the state: on error, the **failed code + error message** are sent back to the Coder so it can fix itself, bounded by a counter (`MAX_CODE_ATTEMPTS`).
+- **Anti-hallucination grounding** — the Explorer establishes the facts; the LLM agents reason over them without inventing, and outputs are *verified* (filtering out any non-existent columns proposed by the Planner) rather than trusted blindly.
+- **Engine / interface separation** — the LangGraph graph is a reusable engine; Streamlit is just a façade on top of it.
 
-### Data schema
+---
 
-| Column | Description |
-|---|---|
-| `date` | Sales record date |
-| `year`, `month`, `weekday` | Date attributes |
-| `region` | Sales region |
-| `category` | Product category |
-| `sales` | Sales amount |
-| `cost` | Cost amount |
-| `units` | Units sold |
-| `orders` | Number of orders |
+## Security: executing LLM-generated code
 
-### Data preparation
+This is the trickiest — and most interesting — part of the project. Running code written by an LLM is dangerous. The chosen approach is deliberately **honest about both its guarantees and its limits**.
 
-The CSV file is the source dataset:
+**Assumed threat model:** **local** use, on user-provided data, with a non-adversarial LLM. The main risk is therefore not malicious code, but **buggy** code (wrong column, infinite loop…).
 
-```text
-data/sample_sales.csv
+**Isolation in place** (via `subprocess`):
+
+| Threat | Protected? | How |
+|--------|:---------:|-----|
+| Code crashes the application | ✅ | Runs in a **separate process** |
+| Code loops forever | ✅ | **Timeout** on the subprocess |
+| Code reads the API key (`OPENAI_API_KEY`) | ✅ | **Minimal environment**: no secrets passed to the child process |
+| Code writes/deletes files | ❌ | *Not protected* — subprocess inherits the user's permissions |
+| Code accesses the network | ❌ | *Not protected* |
+
+**`subprocess` reduces the blast radius, but is not a true sandbox.** The last two rows would require strong isolation (Docker / gVisor / a cloud sandbox such as E2B or Modal).
+
+---
+
+##  Tech stack
+
+- **Orchestration:** LangGraph (shared state, nodes, conditional edges)
+- **LLM:** OpenAI (`gpt-4.1-mini`) via `langchain-openai`, with Pydantic structured output
+- **Data & visualization:** pandas, Plotly
+- **Interface:** Streamlit
+- **Python:** 3.12
+
+---
+
+## 📁 Project structure
+
+```
+data-analyst-agents/
+├── app.py            # Streamlit interface (upload, run, display)
+├── graph.py          # LangGraph graph construction + conditional routing
+├── state.py          # Shared-state definition (TypedDict + reducers)
+├── config.py         # Centralized configuration (API key, model, constants)
+├── data_io.py        # CSV loading and validation
+├── explorer.py       # Explorer agent (pandas profiling)
+├── planner.py        # Planner agent (LLM + Pydantic schema)
+├── coder.py          # Coder agent (generation + execution + self-correction)
+├── execute.py   # Isolated execution sandbox (subprocess + timeout)
+├── writer.py         # Writer agent (interpretation + writing)
+├── requirements.txt
+└── .env              # API key (not committed)
 ```
 
-Build the DuckDB database with:
+---
+
+## 🚀 Setup & run
+
+**Requirements:** Python 3.12 and an OpenAI API key.
 
 ```bash
-python build_db.py
+# 1. Clone the repo
+git clone https://github.com/Maggydata/ai-data-analyst-langgraph.git
+
+# 2. Create the virtual environment and install dependencies
+python3.12 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# 3. Configure the API key
+echo "OPENAI_API_KEY=sk-..." > .env
+
+# 4. Launch the app
+streamlit run app.py
 ```
 
-This loads the CSV data into:
+The app opens at `http://localhost:8501`. Upload a CSV and click **"Run analysis"**.
 
-```text
-data/sales.duckdb
-```
-
-Rebuild the database only when the source CSV changes.
-
-### Date comparison logic
-
-The application interprets **“this week”** as a rolling seven-day period, rather than a calendar week.
-
-- **Current period:** The latest date in the table and the six preceding days.
-- **Previous period:** The seven days immediately before the current period.
-
-This keeps the comparison aligned with the latest data available in the database.
+> 💡 Recommended test dataset: the **Superstore Dataset** (Kaggle). Put the CSV anywhere — the upload happens from the interface.
 
 ---
 
-## 4. Technical Design
+## Demo
 
-### Technology stack
-
-| Technology | Purpose |
-|---|---|
-| **Python** | Investigation logic and execution orchestration |
-| **LangGraph** | Controls the investigation workflow |
-| **DeepSeek API** | Generates investigation plans and Python scripts |
-| **Pydantic** | Validates structured planner output |
-| **DuckDB** | Executes analytical queries against the sales table |
-| **Pandas** | Handles tabular results |
-| **Plotly** | Generates charts |
-| **Streamlit** | Provides the user interface |
-
-### Key design decisions
-
-**1. Separate planning from execution**
-
-The Planner decides what to investigate, while the Coder generates the script for each step. This makes the investigation process easier to inspect than a single unrestricted prompt.
-
-**2. Keep data calculations in SQL**
-
-The model generates code, but DuckDB executes the analytical queries. The model does not directly invent the numerical results returned by those queries.
-
-**3. Restrict database access**
-
-Generated scripts are restricted to read-only queries against the `sales` table. The application validates the script before execution and runs it in a temporary folder.
-
-**4. Use evidence-backed answers**
-
-The Writer receives the result tables rather than the raw source rows. Its answer follows four headings:
-
-- **Finding** — What changed or stands out?
-- **Evidence** — Which figures support the finding?
-- **Comparison** — How does performance compare with the previous period?
-- **Limit** — What cannot be concluded from the available data?
-
-**5. Apply a defined investigation boundary**
-
-The Planner can propose between one and three steps. Failed scripts are retried once, limiting the amount of work performed when generated code does not execute successfully.
-
-**6. Use a defined profit-margin calculation**
-
-Profit margin is calculated as:
-
-\[
-\text{Profit Margin} =
-\frac{\sum(\text{sales}-\text{cost})}{\sum(\text{sales})}
-\]
-
-This is preferable to taking the average of individual row-level profit-margin ratios when calculating an overall margin.
-
-The model chooses the comparison and the Python execution layer checks the actual query and its execution boundary.
-
----
-
-## 5. Business Value
-
-| Capability | Practical value |
-|---|---|
-| Natural-language questions | Reduces dependence on technical SQL knowledge and dashboard filters. |
-| Multi-step investigation | Allows the agent to move from a broad performance concern to a more specific region or category. |
-| SQL-based calculations | Keeps numerical calculations grounded in the database results. |
-| Charts and result tables | Makes findings easier to inspect and verify. |
-| Evidence-backed summaries | Connects the written answer to the figures that support it. |
-| Dynamic date windows | Keeps the comparison aligned with the latest date in the dataset. |
-
-### Why use an agent workflow?
-
-A conventional text-to-SQL tool may answer a question with one query. Sales Check is designed to support a short investigation: it plans the steps, executes each step, retains the intermediate results, and uses those results to produce an initial explanation.
-
-The objective is not to replace an analyst. It is to help a business user arrive at a more informed first question before escalating the issue to the BI team.
-
----
-
-## 6. Limitations and Assumptions
-
-This is a controlled portfolio demonstration, not a production-ready analytics platform.
-
-- **Single data source:** The application uses one DuckDB table and does not connect to an enterprise warehouse.
-- **Synthetic data:** The Lane & Co. dataset is synthetic. The Kowloon beverage sales decline is deliberately planted to demonstrate the investigation workflow.
-- **Limited investigation depth:** The Planner can generate at most three steps. Each failed script is retried once, after which the investigation stops.
-- **No certified metric catalog:** The application does not use a governed business-metric definition layer.
-- **Rolling seven-day comparison:** “This week” means the latest seven days in the file, not the company's official business calendar week.
-- **Potential interpretation errors:** Although the Writer is instructed to cite returned numbers, it may still phrase a comparison or conclusion poorly.
-- **Limited explanatory variables:** The application cannot establish causes involving rent, staff levels, weather, or promotional spending because these variables are absent from the dataset.
-- **No persistent session history:** Results are not saved. Refreshing the page clears the current result.
-
-These limitations mean that the output should be treated as an initial diagnostic hypothesis, not a definitive explanation of the business problem.
-
----
-
-## 7. Project Scope
-
-Sales Check demonstrates a practical combination of business analysis, data querying, and LLM-based workflow orchestration.
-
-Its main focus is the path from a business question to a constrained investigation and an evidence-backed first answer—not simply building a chatbot that can generate SQL.
-
-**Core workflow:** Natural-language question → Investigation plan → Read-only query execution → Charts and result tables → Evidence-backed answer.
-
+![Quick preview](docs/demo.gif)
